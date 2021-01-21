@@ -5,6 +5,7 @@
 #include "channel.h"
 #include "snowflake.h"
 #include "cache.h"
+#include "voice.h"
 
 namespace SleepyDiscord {
 	enum Permission : int64_t;
@@ -69,7 +70,7 @@ namespace SleepyDiscord {
 		int verificationLevel;
 		int defaultMessageNotifications;
 		std::list<Role> roles;
-		//voice_states
+		std::list<VoiceState> voice_states;
 		//emojis
 		//features
 		bool unavailable;
@@ -109,6 +110,7 @@ namespace SleepyDiscord {
 				json::pair                           (&Server::MFALevel                   , "mfa_level"                    , json::OPTIONAL_FIELD ),
 				json::pair                           (&Server::joinedAt                   , "joined_at"                    , json::OPTIONAL_FIELD ),
 				json::pair                           (&Server::large                      , "large"                        , json::OPTIONAL_FIELD ),
+				json::pair<json::ContainerTypeHelper>(&Server::voice_states               , "voice_states"                 , json::OPTIONAL_FIELD ),
 				json::pair<json::ContainerTypeHelper>(&Server::members                    , "members"                      , json::OPTIONAL_FIELD ),
 				json::pair<json::ContainerTypeHelper>(&Server::channels                   , "channels"                     , json::OPTIONAL_FIELD )
 			);

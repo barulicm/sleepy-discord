@@ -117,7 +117,7 @@ if(AUTO_DOWNLOAD_LIBRARY)
 			BINARY_DIR          "${libsodium_BINARY_DIR}"
 			PATCH_COMMAND       "${libsodium_SOURCE_DIR}/autogen.sh"
 			CONFIGURE_COMMAND   "${libsodium_SOURCE_DIR}/configure"
-			BUILD_COMMAND       "make"
+			BUILD_COMMAND       "make" "CFLAGS=-fPIC"
 			INSTALL_COMMAND     "cp" "-TR" "${libsodium_BINARY_DIR}/src/libsodium/include/" "${libsodium_SOURCE_DIR}/src/libsodium/include/"
 			TEST_COMMAND        ""
 		)

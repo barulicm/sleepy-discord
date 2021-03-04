@@ -26,16 +26,17 @@ namespace SleepyDiscord {
 		ready = false;
 		quiting = false;
 		bot = true;
-		token = std::unique_ptr<std::string>(new std::string(_token)); //add client to list
+		setToken(_token);
 		if (_shardID != 0 || _shardCount != 0)
 			setShardID(_shardID, _shardCount);
 
 		messagesRemaining = 4;
-		getTheGateway();
-		connect(theGateway, this, connection);
-#ifndef SLEEPY_ONE_THREAD
-		if (USE_RUN_THREAD <= maxNumOfThreads) runAsync();
-#endif
+		postTask(
+			[this]() {
+				getTheGateway();
+				connect(theGateway, this, connection);
+			}
+		);
 	}
 
 	BaseDiscordClient::~BaseDiscordClient() {
@@ -43,9 +44,10 @@ namespace SleepyDiscord {
 		if (heart.isValid()) heart.stop();
 	}
 
-	void RateLimiter::limitBucket(Route::Bucket& bucket, time_t timestamp) {
+	void RateLimiter::limitBucket(const Route::Bucket& bucket, const std::string& xBucket, time_t timestamp) {
 		std::lock_guard<std::mutex> lock(mutex);
-		buckets[bucket] = timestamp;
+		buckets[bucket] = xBucket;
+		limits[xBucket] = timestamp;
 	}
 
 	const time_t RateLimiter::getLiftTime(Route::Bucket& bucket, const time_t& currentTime) {
@@ -53,11 +55,15 @@ namespace SleepyDiscord {
 				return nextRetry;
 		isGlobalRateLimited = false;
 		std::lock_guard<std::mutex> lock(mutex);
-		auto bucketResetTimestamp = buckets.find(bucket);
-		if (bucketResetTimestamp != buckets.end()) {
-			if (currentTime < bucketResetTimestamp->second)
-				return bucketResetTimestamp->second;
-			buckets.erase(bucketResetTimestamp);
+		auto actualBucket = buckets.find(bucket);
+		if (actualBucket != buckets.end()) {
+			auto bucketResetTimestamp = limits.find(actualBucket->second);
+			if (bucketResetTimestamp != limits.end()) {
+				if (currentTime < bucketResetTimestamp->second)
+					return bucketResetTimestamp->second;
+				limits.erase(bucketResetTimestamp);
+			}
+			buckets.erase(actualBucket);
 		}
 		return 0;
 	}
@@ -133,8 +139,9 @@ namespace SleepyDiscord {
 					int retryAfter = rawRetryAfter != "" ? std::stoi(rawRetryAfter) : 5 * 1000;
 					rateLimiter.isGlobalRateLimited = response.header.find("X-RateLimit-Global") != response.header.end();
 					rateLimiter.nextRetry = getEpochTimeMillisecond() + retryAfter;
+					const std::string& xBucket = response.header["X-RateLimit-Bucket"];
 					if (!rateLimiter.isGlobalRateLimited) {
-						rateLimiter.limitBucket(bucket, rateLimiter.nextRetry);
+						rateLimiter.limitBucket(bucket, xBucket, rateLimiter.nextRetry);
 						onDepletedRequestSupply(bucket, retryAfter);
 					}
 					handleExceededRateLimit(retryAfter);
@@ -176,6 +183,7 @@ namespace SleepyDiscord {
 				std::istringstream dateStream(response.header["Date"]);
 				dateStream >> std::get_time(&date, "%a, %d %b %Y %H:%M:%S GMT");
 				const time_t reset = std::stoi(response.header["X-RateLimit-Reset"]);
+				const std::string& xBucket = response.header["X-RateLimit-Bucket"];
 #if defined(_WIN32) || defined(_WIN64)
 				std::tm gmTM;
 				std::tm*const resetGM = &gmTM;
@@ -184,7 +192,7 @@ namespace SleepyDiscord {
 				std::tm* resetGM = std::gmtime(&reset);
 #endif
 				const time_t resetDelta = (std::mktime(resetGM) - std::mktime(&date)) * 1000;
-				rateLimiter.limitBucket(bucket, resetDelta + getEpochTimeMillisecond());
+				rateLimiter.limitBucket(bucket, xBucket, resetDelta + getEpochTimeMillisecond());
 				onDepletedRequestSupply(bucket, resetDelta);
 			}
 
@@ -244,7 +252,15 @@ namespace SleepyDiscord {
 
 	void BaseDiscordClient::requestServerMembers(ServerMembersRequest request) {
 		auto data = json::toJSON(request);
-		sendL(json::stringify(data));
+		std::string stringData = json::stringify(data);
+
+		std::string query;
+		query.reserve(14 + stringData.length());
+		query += "{\"op\":8,\"d\":";
+		query += stringData;
+		query += "}";
+
+		sendL(query);
 	}
 
 	void BaseDiscordClient::waitTilReady() {
@@ -287,6 +303,8 @@ namespace SleepyDiscord {
 			}
 		}
 #endif
+		if (useTrasportConnection == 1)
+			theGateway += "&compress=zlib-stream";
 	}
 
 	void BaseDiscordClient::sendIdentity() {
@@ -298,8 +316,6 @@ namespace SleepyDiscord {
 		//			$os":"windows 10",
 		//			"$browser":"Sleepy_Discord",
 		//			"$device":"Sleepy_Discord",
-		//			"$referrer":"",			//I don't know what this does
-		//			"$referring_domain":""		//I don't know what this does
 		//		},
 		//		"compress":false,
 		//		"large_threshold":250			/I don't know what this does
@@ -328,11 +344,11 @@ namespace SleepyDiscord {
 				"\"properties\":{"
 					"\"$os\":\""; identity += os; identity += "\","
 					"\"$browser\":\"Sleepy_Discord\","
-					"\"$device\":\"Sleepy_Discord\","
-					"\"$referrer\":\"\","
-					"\"$referring_domain\":\"\""
+					"\"$device\":\"Sleepy_Discord\""
 				"},"
-				"\"compress\":false,";
+				"\"compress\":";
+					identity += compressionHandler && useTrasportConnection != 1 ?
+						"true" : "false"; identity += ",";
 		if (shardCount != 0 && shardID <= shardCount) {
 			identity +=
 				"\"shard\":[";
@@ -415,6 +431,9 @@ namespace SleepyDiscord {
 		}, getRetryDelay());
 		consecutiveReconnectsCount += 1;
 
+		if (useTrasportConnection == 1)
+			compressionHandler->resetStream();
+
 		for (VoiceConnection& voiceConnection : voiceConnections) {
 			disconnect(4900, "", voiceConnection.connection);
 	}
@@ -451,11 +470,9 @@ namespace SleepyDiscord {
 	void BaseDiscordClient::processMessage(const std::string &message) {
 		rapidjson::Document document;
 		document.Parse(message.c_str(), message.length());
-		//json::Values values = json::getValues(message.c_str(),
-		//	{ "op", "d", "s", "t" });
+		//	{ "op", "d", "s", "t" }
 		int op = document["op"].GetInt();
 		const json::Value& t = document["t"];
-		//const nonstd::string_view t(tValue.GetString(), tValue.GetStringLength);
 		const json::Value& d = document["d"];
 		switch (op) {
 		case DISPATCH:
@@ -582,7 +599,6 @@ namespace SleepyDiscord {
 			case hash("PRESENCE_UPDATE"            ): onPresenceUpdate    (d); break;
 			case hash("PRESENCES_REPLACE"          ):                          break;
 			case hash("USER_UPDATE"                ): onEditUser          (d); break;
-			case hash("USER_NOTE_UPDATE"           ): onEditUserNote      (d); break;
 			case hash("USER_SETTINGS_UPDATE"       ): onEditUserSettings  (d); break;
 			case hash("VOICE_STATE_UPDATE"         ): {
 				VoiceState state(d);
@@ -624,15 +640,11 @@ namespace SleepyDiscord {
 #endif
 				onEditVoiceServer(voiceServer);
 				} break;
-			case hash("GUILD_SYNC"                 ): onServerSync        (d); break;
-			case hash("RELATIONSHIP_ADD"           ): onRelationship      (d); break;
-			case hash("RELATIONSHIP_REMOVE"        ): onDeleteRelationship(d); break;
 			case hash("MESSAGE_REACTION_ADD"       ): onReaction          (d["user_id"], d["channel_id"], d["message_id"], d["emoji"]); break;
 			case hash("MESSAGE_REACTION_REMOVE"    ): onDeleteReaction    (d["user_id"], d["channel_id"], d["message_id"], d["emoji"]); break;
 			case hash("MESSAGE_REACTION_REMOVE_ALL"): onDeleteAllReaction (d["guild_id"], d["channel_id"], d["message_id"]); break;
 			default: 
-				setError(EVENT_UNKNOWN);
-				onError(ERROR_NOTE, json::toStdString(t));
+				onUnknownEvent(json::toStdString(t), d);
 				break;
 			}
 			onDispatch(d);
@@ -660,6 +672,49 @@ namespace SleepyDiscord {
 			wasHeartbeatAcked = true;
 			onHeartbeatAck();
 			break;
+		}
+	}
+
+	void BaseDiscordClient::processMessage(const WebSocketMessage message) {
+		switch (message.opCode) {
+		case WebSocketMessage::OPCode::binary: {
+			if (!compressionHandler)
+				break;
+			compressionHandler->uncompress(message.payload);
+			
+			//when using transport connections, Discord ends streams the flush siginal
+			constexpr std::array<const char, 4> flushSiginal = { 0, 0, '\xFF', '\xFF'};
+			constexpr std::size_t siginalLength = flushSiginal.max_size();
+			bool endsWithFlushSiginal = false;
+			if (useTrasportConnection == 1 && siginalLength <= message.payload.length()) {
+				const auto compare = message.payload.compare(
+					message.payload.length() - siginalLength, siginalLength,
+					flushSiginal.data(), siginalLength);
+				endsWithFlushSiginal = compare == 0;
+			}
+
+			//trasportConnection doesn't stop the stream
+			bool streamEnded = useTrasportConnection != 1 && compressionHandler->streamEnded();
+
+			if (streamEnded || endsWithFlushSiginal) {
+				std::shared_ptr<std::string> uncompressed = std::make_shared<std::string>();
+				compressionHandler->getOutput(*uncompressed);
+				postTask(
+					[this, uncompressed]() {
+						processMessage(*uncompressed);
+					}
+				);
+			}
+			break;
+		}
+		case WebSocketMessage::OPCode::text: {
+			postTask(
+				[this, message]() {
+					processMessage(message.payload);
+				}
+			);
+			break;
+		}
 		}
 	}
 
@@ -694,6 +749,10 @@ namespace SleepyDiscord {
 		case DISALLOWED_INTENTS:
 			return quit(false, true);
 			break;
+
+		case 4900: //Sleepy Discord reconnect
+			//don't do another reconnect during a reconnect
+			return;
 		}
 		reconnect();
 	}
@@ -718,6 +777,8 @@ namespace SleepyDiscord {
 		sendHeartbeat();
 		lastHeartbeat = currentTime;
 
+		if (heart.isValid())
+			heart.stop();
 		heart = schedule(&BaseDiscordClient::heartbeat, heartbeatInterval);
 	}
 

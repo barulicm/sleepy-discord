@@ -1,5 +1,4 @@
 add_library(sleepy-discord STATIC
-	asignments_client.cpp
 	asio_udp.cpp
 	attachment.cpp
 	channel.cpp
@@ -22,6 +21,7 @@ add_library(sleepy-discord STATIC
 	voice_connection.cpp
 	webhook.cpp
 	websocketpp_websocket.cpp
+	zlib-ng_compression.cpp
 )
 
 target_include_directories(sleepy-discord
@@ -31,6 +31,9 @@ target_include_directories(sleepy-discord
 	PRIVATE
 		${PROJECT_SOURCE_DIR}/include/sleepy_discord
 )
+
+set(SLEEPY_INCLUDE_NONEXIST
+	${PROJECT_SOURCE_DIR}/include/sleepy_discord/IncludeNonexistent)
 
 #The codebase is c++11 but both clang and visual c++ have issues with c++11
 #These issues are fixed by using preprocessor defines to replace code that
@@ -117,7 +120,6 @@ if (NOT ONLY_SLEEPY_DISCORD)
 			add_dependencies(sleepy-discord libsodium-make)
 			ExternalProject_Get_property(libsodium-make BINARY_DIR)
 			set(libsodium-make_BINARY_DIR ${BINARY_DIR})
-			message(WARNING ${libsodium-make_BINARY_DIR})
 			set(
 				LIB_SODIUM_BUILDS 
 				${libsodium-make_BINARY_DIR}/src/libsodium/.libs/${CMAKE_STATIC_LIBRARY_PREFIX}sodium${CMAKE_STATIC_LIBRARY_SUFFIX}
@@ -133,6 +135,15 @@ if (NOT ONLY_SLEEPY_DISCORD)
 	else()
 		target_compile_definitions(sleepy-discord PUBLIC NONEXISTENT_SODIUM)
 	endif()
+
+	if(USE_ZLIB_NG)
+		get_target_property(ZLIB_BINARY_DIR zlib BINARY_DIR)
+		target_include_directories(sleepy-discord PUBLIC ${zlib-ng_SOURCE_DIR}/../ ${ZLIB_BINARY_DIR})
+		list(APPEND LIBRARIES_TO_LINK "zlib")
+		target_compile_definitions(sleepy-discord PUBLIC EXISTENT_ZLIB_NG)
+	else()
+		target_compile_definitions(sleepy-discord PUBLIC NONEXISTENT_ZLIB_NG)
+	endif()
 	target_link_libraries(sleepy-discord PUBLIC ${LIBRARIES_TO_LINK})
 else()
 	target_compile_definitions(sleepy-discord PUBLIC
@@ -147,7 +158,6 @@ endif()
 
 if(NOT Git_FOUND)
 	target_compile_definitions(sleepy-discord PRIVATE NONEXISTANT_GIT_INFO)
-
 endif()
 
 if(ENABLE_VOICE)

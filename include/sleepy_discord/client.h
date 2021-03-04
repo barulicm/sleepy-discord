@@ -27,6 +27,7 @@
 #include "timer.h"
 #include "voice_connection.h"
 #include "asio_schedule.h"
+#include "compression.h"
 
 namespace SleepyDiscord {
 #define TOKEN_SIZE 64
@@ -79,11 +80,12 @@ namespace SleepyDiscord {
 	struct RateLimiter {
 		std::atomic<bool> isGlobalRateLimited = { false };
 		std::atomic<time_t> nextRetry = { 0 };
-		void limitBucket(Route::Bucket& bucket, time_t timestamp);
+		void limitBucket(const Route::Bucket& bucket, const std::string& xBucket, time_t timestamp);
 		const time_t getLiftTime(Route::Bucket& bucket, const time_t& currentTime);
 		//isLimited also returns the next Retry timestamp
 	private:
-		std::unordered_map<Route::Bucket, time_t> buckets;
+		std::unordered_map<Route::Bucket, std::string> buckets;
+		std::unordered_map<std::string, time_t> limits;
 		std::mutex mutex;
 	};
 
@@ -251,7 +253,7 @@ namespace SleepyDiscord {
 		ObjectResponse<Message     > uploadFile              (Snowflake<Channel> channelID, std::string fileLocation, std::string message, Embed embed = Embed::Flag::INVALID_EMBED, RequestSettings<ObjectResponse<Message>> settings = {});
 		BoolResponse                 addReaction             (Snowflake<Channel> channelID, Snowflake<Message> messageID, std::string emoji                                , RequestSettings<BoolResponse           > settings = {});
 		BoolResponse                 removeReaction          (Snowflake<Channel> channelID, Snowflake<Message> messageID, std::string emoji, Snowflake<User> userID = "@me");
-		ArrayResponse <Reaction    > getReactions            (Snowflake<Channel> channelID, Snowflake<Message> messageID, std::string emoji                                , RequestSettings<ArrayResponse<Reaction>> settings = {});
+		ArrayResponse <User        > getReactions            (Snowflake<Channel> channelID, Snowflake<Message> messageID, std::string emoji                                , RequestSettings<ArrayResponse<Reaction>> settings = {});
 		StandardResponse             removeAllReactions      (Snowflake<Channel> channelID, Snowflake<Message> messageID                                                   , RequestSettings<StandardResponse       > settings = {});
 		ObjectResponse<Message     > editMessage             (Snowflake<Channel> channelID, Snowflake<Message> messageID, std::string newMessage, Embed embed = Embed::Flag::INVALID_EMBED, RequestSettings<ObjectResponse<Message>> settings = {});
 		BoolResponse                 deleteMessage           (Snowflake<Channel> channelID, Snowflake<Message> messageID                                                   , RequestSettings<BoolResponse           > settings = {});
@@ -299,7 +301,7 @@ namespace SleepyDiscord {
 		BoolResponse                 removeRole              (Snowflake<Server> serverID, Snowflake<User> userID, Snowflake<Role> roleID         , RequestSettings<BoolResponse                 > settings = {});
 		BoolResponse                 kickMember              (Snowflake<Server> serverID, Snowflake<User> userID                                 , RequestSettings<BoolResponse                 > settings = {});
 		ArrayResponse <User        > getBans                 (Snowflake<Server> serverID                                                         , RequestSettings<ArrayResponse<User          >> settings = {});  //to do test this
-		BoolResponse                 banMember               (Snowflake<Server> serverID, Snowflake<User> userID                                 , RequestSettings<BoolResponse                 > settings = {});
+		BoolResponse                 banMember               (Snowflake<Server> serverID, Snowflake<User> userID, int deleteMessageDays = -1, std::string reason = "", RequestSettings<BoolResponse> settings = {});
 		BoolResponse                 unbanMember             (Snowflake<Server> serverID, Snowflake<User> userID                                 , RequestSettings<BoolResponse                 > settings = {});
 		ArrayResponse <Role        > getRoles                (Snowflake<Server> serverID                                                         , RequestSettings<ArrayResponse<Role          >> settings = {});
 		ObjectResponse<Role        > createRole              (Snowflake<Server> serverID, std::string name = "", Permission permissions = Permission::NONE, unsigned int color = 0, bool hoist = false, bool mentionable = false);
@@ -384,6 +386,23 @@ namespace SleepyDiscord {
 			setIntents(intents);
 		}
 
+		template <class Handler, class... Types>
+		void useCompression(Types&&... arguments) {
+			compressionHandler = std::unique_ptr<GenericCompression>(
+				new Handler(std::forward<Types>(arguments)...));
+			if (useTrasportConnection == static_cast<int8_t>(-1)) //if not set yet
+				useTrasportConnection = true;
+		}
+
+		void useCompression(bool value = true) {
+#ifdef SLEEPY_DEFAULT_COMPRESSION
+			if (value) useCompression<DefaultCompression>();
+			else scheduleHandler = nullptr;
+#else
+			assert(((void)"No default compress handler, use zlib-ng or use template function instead", value == false));
+#endif
+		}
+
 		//time
 		template <class Handler, class... Types>
 		inline void setScheduleHandler(Types&&... arguments) {
@@ -404,7 +423,7 @@ namespace SleepyDiscord {
 		inline  Timer  schedule(void (BaseDiscordClient::*code)(), const time_t milliseconds, AssignmentType mode = TilDueTime) {
 			return     schedule(std::bind(code, this), milliseconds, mode);
 		}
-		inline  void  unschedule(const Timer& timer) const { timer.stop(); }
+		inline  void  unschedule(Timer& timer) { timer.stop(); }
 
 		typedef TimedTask PostableTask;
 		virtual void postTask(PostableTask code) {
@@ -536,16 +555,12 @@ namespace SleepyDiscord {
 		virtual void onPinMessage        (Snowflake<Channel> channelID, std::string lastPinTimestamp);
 		virtual void onPresenceUpdate    (PresenceUpdate     presenseUpdate);
 		virtual void onEditUser          (User               user       );
-		virtual void onEditUserNote      (const json::Value& jsonMessage);
 		virtual void onEditUserSettings  (const json::Value& jsonMessage);
 		virtual void onEditVoiceState    (VoiceState&        state      );
 		virtual void onTyping            (Snowflake<Channel> channelID, Snowflake<User> userID, time_t timestamp);
 		virtual void onDeleteMessages    (Snowflake<Channel> channelID, std::vector<Snowflake<Message>> messages);
 		virtual void onEditMessage       (MessageRevisions   revisioins );
 		virtual void onEditVoiceServer   (VoiceServerUpdate& update     );
-		virtual void onServerSync        (const json::Value& jsonMessage);
-		virtual void onRelationship      (const json::Value& jsonMessage);
-		virtual void onDeleteRelationship(const json::Value& jsonMessage);
 		virtual void onReaction          (Snowflake<User> userID, Snowflake<Channel> channelID, Snowflake<Message> messageID, Emoji emoji);
 		virtual void onDeleteReaction    (Snowflake<User> userID, Snowflake<Channel> channelID, Snowflake<Message> messageID, Emoji emoji);
 		virtual void onDeleteAllReaction (Snowflake<Server> serverID, Snowflake<Channel> channelID, Snowflake<Message> messageID);
@@ -553,6 +568,7 @@ namespace SleepyDiscord {
 		virtual void onServer            (Server             server     );
 		virtual void onChannel           (Channel            channel    );
 		virtual void onDispatch          (const json::Value& jsonMessage);
+		virtual void onUnknownEvent      (std::string name, const json::Value& data); //for extending old library versions
 
 		//websocket stuff
 		virtual void onHeartbeat();
@@ -572,11 +588,13 @@ namespace SleepyDiscord {
 		/*do not use or overwrite the protected values below,
 		unless you know what you are doing*/
 		void processMessage(const std::string &message) override;
+		void processMessage(const WebSocketMessage message) override;
 		void processCloseCode(const int16_t code) override;
 		void heartbeat();
 		void sendHeartbeat();
 		void resetHeartbeatValues();
 		inline std::string getToken() { return *token.get(); }
+		inline void setToken(const std::string& value) { token = std::unique_ptr<std::string>(new std::string(value)); }
 		void start(const std::string _token, const char maxNumOfThreads = DEFAULT_THREADS, int _shardID = 0, int _shardCount = 0);
 		virtual bool connect(
 			const std::string & /*uri*/,                    //IN
@@ -662,13 +680,17 @@ namespace SleepyDiscord {
 		//
 		//voice
 		//
-		std::list<VoiceConnection> voiceConnections;
+		std::forward_list<VoiceConnection> voiceConnections;
 		std::forward_list<VoiceContext> voiceContexts;
 		std::forward_list<VoiceContext*> waitingVoiceContexts;
 #ifdef SLEEPY_VOICE_ENABLED
 		void connectToVoiceIfReady(VoiceContext& context);
 		void removeVoiceConnectionAndContext(VoiceConnection& connection);
 #endif
+
+		//compression
+		std::unique_ptr<GenericCompression> compressionHandler;
+		int8_t useTrasportConnection = static_cast<int8_t>(-1); //-1 for not set
 
 		template<class Callback>
 		void findServerInCache(Snowflake<Server>& serverID, Callback onSuccessCallback) {
@@ -742,36 +764,6 @@ namespace SleepyDiscord {
 				}
 			);
 		}
-	};
-
-	//inline BaseDiscordClient::AssignmentType operator|(BaseDiscordClient::AssignmentType left, BaseDiscordClient::AssignmentType right) {
-	//	return static_cast<BaseDiscordClient::AssignmentType>(static_cast<char>(left) | static_cast<char>(right));
-	//}
-	//inline BaseDiscordClient::AssignmentType operator&(BaseDiscordClient::AssignmentType left, BaseDiscordClient::AssignmentType right) {
-	//	return static_cast<BaseDiscordClient::AssignmentType>(static_cast<char>(left) & static_cast<char>(right));
-	//}
-
-	/*Used when you like to have the DiscordClient to handle the timer via a loop but
-	  don't want to do yourself. I plan on somehow merging this with the baseClient
-	  somehow
-
-	  This is here temporarily until the DiscordClient is overhauled
-	  */
-	class AssignmentBasedDiscordClient : public BaseDiscordClient {
-	public:
-		Timer schedule(TimedTask code, const time_t milliseconds);
-	protected:
-		void resumeMainLoop();
-		void doAssignment();
-	private:
-		struct Assignment {
-			int jobID;
-			TimedTask function;
-			time_t dueTime;
-		};
-		std::forward_list<Assignment> assignments;
-
-		void unschedule(const int jobID);
 	};
 
 	template<> struct BaseDiscordClient::RequestModeType<Async> : BaseDiscordClient::RawRequestModeTypeHelper<Async, void> {
